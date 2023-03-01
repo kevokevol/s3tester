@@ -1,11 +1,16 @@
 package main
 
 import (
+	"cloud.google.com/go/storage"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,11 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"time"
 )
 
 const (
@@ -60,30 +61,47 @@ func Options(client *http.Client, endpoint string) error {
 }
 
 // Put performs an S3 PUT to the given bucket and key using the supplied configuration
-func Put(svc s3iface.S3API, bucket, key, tagging string, size int64, metadata map[string]*string) error {
+func Put(gsc *storage.Client, bucket, key, tagging string, size int64, metadata map[string]*string) (time.Duration, error) {
 	obj := NewDummyReader(size, key)
-
-	hash, herr := calcMD5(obj)
+	hash, herr := calcMD5Raw(obj)
 	if herr != nil {
-		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+		return -1, fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
 	}
 
-	params := &s3.PutObjectInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
-		ContentLength: &size,
-		ContentMD5:    aws.String(hash),
-		Body:          obj,
-		Metadata:      metadata,
+	/*
+		hash, herr := calcMD5(obj)
+		if herr != nil {
+			return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, herr)
+		}
+
+		params := &s3.PutObjectInput{
+			Bucket:        aws.String(bucket),
+			Key:           aws.String(key),
+			ContentLength: &size,
+			ContentMD5:    aws.String(hash),
+			Body:          obj,
+			Metadata:      metadata,
+		}
+
+		if tagging != "" {
+			params.SetTagging(tagging)
+		}
+
+		_, err := svc.PutObject(params)
+	*/
+
+	w := gsc.Bucket(bucket).Object(key).NewWriter(context.TODO())
+	w.MD5 = hash
+	_, err := io.Copy(w, obj)
+	if err != nil {
+		log.Printf("Err: %v", err)
+		return -1, err
 	}
+	start := time.Now()
+	err = w.Close()
+	elapsed := time.Since(start)
 
-	if tagging != "" {
-		params.SetTagging(tagging)
-	}
-
-	_, err := svc.PutObject(params)
-
-	return err
+	return elapsed, err
 }
 
 // Copy performs an S3 PUT-Copy which copies the S3 object specified by the supplied key from copySourceBucket into destinationBucket
@@ -163,6 +181,23 @@ func calcMD5(r *DummyReader) (hash string, err error) {
 	}
 	hash = base64.StdEncoding.EncodeToString(h.Sum(nil))
 	return hash, nil
+}
+
+// calcMD5 calculates the MD5 for data read from the reader. If we ever care about x-amx-Content-Sha256 header then we'll need to add that.
+func calcMD5Raw(r *DummyReader) (hash []byte, err error) {
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		_, err = r.Seek(0, io.SeekStart)
+	}()
+
+	h := md5.New()
+	if _, err = io.Copy(h, r); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
 
 // MultipartPut initiates an S3 multipart upload for the given S3 object specified by the supplied bucket and key
@@ -279,22 +314,36 @@ func MultipartPut(ctx context.Context, svc s3iface.S3API, bucket, key string, si
 }
 
 // Get performs an S3 GET for the S3 object specified by the supplied bucket and key
-func Get(svc s3iface.S3API, bucket, key, byteRange string, size int64, verify int, partSize int64) (int64, error) {
-	params := &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	}
-
-	if byteRange != "" {
-		params.Range = aws.String(byteRange)
-	}
-
-	out, err := identityGetObject(svc, params, verify, partSize, size)
+func Get(gsc *storage.Client, bucket, key, byteRange string, size int64, verify int, partSize int64) (time.Duration, int64, error) {
+	//params := &s3.GetObjectInput{
+	//	Bucket: aws.String(bucket),
+	//	Key:    aws.String(key),
+	//}
+	//
+	//if byteRange != "" {
+	//	params.Range = aws.String(byteRange)
+	//}
+	//
+	//out, err := identityGetObject(svc, params, verify, partSize, size)
+	//if err != nil {
+	//	return 0, err
+	//}
+	start := time.Now()
+	r, err := gsc.Bucket(bucket).Object(key).NewReader(context.TODO())
 	if err != nil {
-		return 0, err
+		log.Printf("NewReader Err: %v", err)
+		return -1, 0, err
 	}
+	n, err := io.Copy(io.Discard, r)
+	elapsed := time.Since(start)
 
-	return *out.ContentLength, err
+	if err != nil {
+		log.Printf("Copy Err: %v", err)
+		return -1, 0, err
+	}
+	err = r.Close()
+
+	return elapsed, n, err
 }
 
 // Head performs an S3 HEAD for the S3 object specified by the supplied bucket and key
@@ -445,14 +494,15 @@ func RestoreObject(svc s3iface.S3API, bucket string, key string, tier string, da
 }
 
 // DispatchOperation performs an S3 request based on the supplied arguments
-func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Client, op, keyName string, args *Parameters, r *Result, randMax int64, sysInterruptHandler SyscallHandler, debug bool) error {
+func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Client, op, keyName string, args *Parameters, r *Result, randMax int64, sysInterruptHandler SyscallHandler, gsc *storage.Client) (time.Duration, error) {
 	var err error
+	elapsed := time.Duration(-1)
 
 	switch op {
 	case "options":
 		err = Options(client, r.Endpoint)
 	case "put":
-		if err = Put(svc, args.Bucket, keyName, args.Tagging, args.Size, parseMetadataString(args.Metadata)); err == nil {
+		if elapsed, err = Put(gsc, args.Bucket, keyName, args.Tagging, args.Size, parseMetadataString(args.Metadata)); err == nil {
 			r.TotalObjectSize += args.Size
 		}
 	case "puttagging":
@@ -465,7 +515,7 @@ func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Clie
 		}
 	case "get":
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.Bucket, keyName, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+		if elapsed, retrievedBytes, err = Get(gsc, args.Bucket, keyName, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "head":
@@ -482,7 +532,7 @@ func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Clie
 
 		key := args.Prefix + "-" + strconv.FormatInt(objnum, 10)
 		var retrievedBytes int64
-		if retrievedBytes, err = Get(svc, args.Bucket, key, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
+		if elapsed, retrievedBytes, err = Get(gsc, args.Bucket, key, args.Range, args.Size, args.Verify, args.PartSize); err == nil {
 			r.TotalObjectSize += retrievedBytes
 		}
 	case "restore":
@@ -491,5 +541,5 @@ func DispatchOperation(ctx context.Context, svc s3iface.S3API, client *http.Clie
 		err = Copy(svc, args.CopySourceBucket, args.Bucket, keyName, args.Tagging, args.TaggingDirective,
 			parseMetadataString(args.Metadata), args.MetadataDirective)
 	}
-	return err
+	return elapsed, err
 }

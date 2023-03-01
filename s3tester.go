@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"cloud.google.com/go/storage"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/api/option"
 	"io"
 	"io/ioutil"
 	"log"
@@ -320,7 +322,7 @@ func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args 
 		if op.Event == "updatemeta" {
 			args.Metadata = metadataValue(int(op.Size))
 		}
-		sendRequest(ctx, svc, httpClient, op.Event, op.Key, args, r, limiter, sysInterruptHandler, debug)
+		sendRequest(ctx, svc, httpClient, op.Event, op.Key, args, r, limiter, sysInterruptHandler, nil)
 		if durationLimit.enabled() {
 			return
 		}
@@ -328,11 +330,13 @@ func ReceiveS3Op(ctx context.Context, svc *s3.S3, httpClient *http.Client, args 
 	workersChan.wg.Done()
 }
 
-func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opType string, keyName string, args *Parameters, r *Result, limiter *rate.Limiter, sysInterruptHandler SyscallHandler, debug bool) {
+func sendRequest(ctx context.Context, svc *s3.S3, httpClient *http.Client, opType string, keyName string, args *Parameters, r *Result, limiter *rate.Limiter, sysInterruptHandler SyscallHandler, gsc *storage.Client) {
 	r.Count++
 	start := time.Now()
-	err := DispatchOperation(ctx, svc, httpClient, opType, keyName, args, r, int64(args.Requests), sysInterruptHandler, debug)
-	elapsed := time.Since(start)
+	elapsed, err := DispatchOperation(ctx, svc, httpClient, opType, keyName, args, r, int64(args.Requests), sysInterruptHandler, gsc)
+	if elapsed < 0 {
+		elapsed = time.Since(start)
+	}
 	r.RecordLatency(elapsed)
 	if err != nil {
 		r.Failcount++
@@ -354,6 +358,21 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 	httpClient := MakeHTTPClient()
 	svc := MakeS3Service(httpClient, config, &args, endpoint, credentials)
 	var source *rand.Rand
+
+	var gsc *storage.Client
+	if endpoint != "https://127.0.0.1:18082" /* default endpoint */ {
+		gsc_, err := storage.NewClient(context.TODO(), option.WithEndpoint(endpoint))
+		if err != nil {
+			log.Fatal(err)
+		}
+		gsc = gsc_
+	} else {
+		gsc_, err := storage.NewClient(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		gsc = gsc_
+	}
 
 	r := NewResult()
 	r.Endpoint = endpoint
@@ -419,7 +438,7 @@ func worker(ctx context.Context, results chan<- Result, config *Config, args Par
 						args.Size = args.randomRangeSize
 					}
 				}
-				sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, limiter, sysInterruptHandler, config.Debug)
+				sendRequest(ctx, svc, httpClient, args.Operation, keyName, &args, &r, limiter, sysInterruptHandler, gsc)
 
 				if durationLimit.enabled() {
 					results <- r
